@@ -1,4 +1,4 @@
-from nvoid_scraper import scrape_jobs
+from nvoid_scraper import create_driver, scrape_query, _pause
 from job_parser import parse_job
 from gmail_service import get_gmail_service, create_draft, get_gmail_profile
 from openpyxl import Workbook, load_workbook
@@ -133,12 +133,24 @@ def build_email_body(title, recruiter_email, description, posted_at=None):
 
     # Convert IST (UTC+5:30) to EST (UTC-5) = subtract 10h30m
     posted_est = (posted_at - timedelta(hours=10, minutes=30)) if posted_at else None
-    posted_line = f"      <strong>Posted:</strong> {posted_est.strftime('%I:%M %p, %d %b %Y')}<br>\n" if posted_est else ""
+
+    # Cloud platform detection: AWS=1, Azure=2, GCP=3
+    desc_lower = (description or "").lower()
+    cloud_nums = []
+    if "aws" in desc_lower or "amazon web services" in desc_lower:
+        cloud_nums.append("1")
+    if "azure" in desc_lower:
+        cloud_nums.append("2")
+    if "gcp" in desc_lower or "google cloud" in desc_lower:
+        cloud_nums.append("3")
+    cloud_suffix = " - " + ", ".join(cloud_nums) if cloud_nums else ""
+
+    posted_line = f"      <strong>Posted:</strong> {posted_est.strftime('%I:%M %p, %d %b %Y')}{cloud_suffix}<br>\n" if posted_est else ""
 
     return f"""<html>
   <body style='font-family:Arial, sans-serif; font-size:14px; color:#111;'>
     <p>{greeting}</p>
-    <p>This is Yashwanth Chowdary, a {intro_title} with over a decade of experience across banking and healthcare domains, delivering scalable and cloud-based solutions.</p>
+    <p>This is Yashwanth Chowdary, a Senior {intro_title} with over a decade of experience across banking and healthcare domains, delivering scalable and cloud-based solutions.</p>
     <p>I am currently available for C2C opportunities and open to relocation. Please find my resume attached for your review.</p>
     <p>
       <strong>Visa:</strong> H1B<br>
@@ -148,12 +160,10 @@ def build_email_body(title, recruiter_email, description, posted_at=None):
     <h3 style='margin-bottom:4px;'>Job Details</h3>
     <p style='margin-top:0;'>
       <strong>Title:</strong> {escaped_title}<br>
-      <strong>Recruiter Email:</strong> {escaped_email}<br>
+      <strong>Recruiter Email:</strong> <span style='user-select:all;'>{escaped_email}</span><br>
 {phone_line}{posted_line}    </p>
     <h4 style='margin-bottom:4px;'>Job Description</h4>
-    <pre style='font-family:inherit; white-space:pre-wrap; word-break:break-word; background:#f9f9f9; padding:12px; border:1px solid #ddd; border-radius:4px;'>
-{escaped_desc}
-    </pre>
+    <div style='white-space:pre-wrap; word-break:break-word; background:#f9f9f9; padding:12px; border:1px solid #ddd; border-radius:4px; font-family:Arial, sans-serif; font-size:14px;'>{escaped_desc}</div>
     <hr>
     <p>
       Best regards,<br>
@@ -193,104 +203,138 @@ def save_applied_job(job_id, title, link, emails, phones, status, description_si
     wb.save(TRACKER_FILE)
 
 
+def _process_jobs(driver, jobs, service, seen_signatures, seen_description_signatures,
+                  current_run_ids, drafted_count, skipped_duplicates, job_counter):
+    """
+    Process a batch of jobs. Returns (drafted_count, skipped_duplicates, job_counter, stop_all).
+    stop_all=True means MAX_EMAILS_PER_RUN hit — caller should stop all queries.
+    """
+    stop_all = False
+    for job in jobs:
+        if drafted_count >= MAX_EMAILS_PER_RUN:
+            stop_all = True
+            break
+
+        title = job.get("title", "")
+        link = job.get("link", "")
+        posted_at = job.get("posted_at")
+        job_id = extract_job_id(link)
+        signature = normalize_text(title)
+
+        job_counter += 1
+        print(f"\nProcessing job {job_counter}...")
+        print("Title:", title)
+
+        if is_job_already_processed(job_id, title):
+            # If this job was drafted earlier in the current run (e.g. appeared in a
+            # prior query), just skip it — don't stop, there may be newer jobs ahead.
+            if job_id in current_run_ids or signature in current_run_ids:
+                print("Skipped: duplicate from current run")
+                skipped_duplicates += 1
+                continue
+            # Otherwise it's from a previous run — all subsequent jobs are old too.
+            print("Skipped: already processed — done with this query (newer jobs come first)")
+            break
+
+        if not is_title_relevant(title):
+            print("Skipped: not relevant by title")
+            continue
+
+        if signature and signature in seen_signatures:
+            print("Skipped: duplicate title in current run")
+            skipped_duplicates += 1
+            continue
+
+        seen_signatures.add(signature)
+
+        try:
+            parsed = parse_job(driver, job)
+        except Exception as e:
+            print(f"Error parsing job: {e}")
+            continue
+
+        emails = parsed.get("emails", [])
+        phones = parsed.get("phones", [])
+        desc = parsed.get("description", "")
+        desc_signature = normalize_text(desc)
+
+        if desc_signature and desc_signature in seen_description_signatures:
+            print("Skipped: duplicate job description in current run")
+            skipped_duplicates += 1
+            continue
+
+        if is_job_already_processed(job_id, title, desc):
+            print("Skipped: duplicate (already processed by description)")
+            skipped_duplicates += 1
+            continue
+
+        seen_description_signatures.add(desc_signature)
+
+        print("Emails:", emails)
+
+        if not emails:
+            print("Skipped: no email")
+            continue
+
+        best_email = pick_best_email(emails)
+
+        if not best_email:
+            print("Skipped: no valid recruiter email")
+            continue
+
+        subject = f"Interested || {title[:80]}"
+        body = build_email_body(title, best_email, desc, posted_at)
+        try:
+            draft = create_draft(service, best_email, subject, body, cc=EMPLOYER_EMAIL, html=True)
+            print(f"Draft created for {best_email} (id={draft.get('id')})")
+            save_applied_job(job_id, title, link, [best_email], phones, "draft_created", desc_signature)
+            current_run_ids.add(job_id)
+            current_run_ids.add(signature)
+            drafted_count += 1
+            time.sleep(DELAY_BETWEEN_EMAILS)
+        except Exception as e:
+            print(f"Draft creation failed: {e}")
+            save_applied_job(job_id, title, link, emails, phones, "draft_failed")
+
+    return drafted_count, skipped_duplicates, job_counter, stop_all
+
+
 def main():
     try:
-        driver, jobs = scrape_jobs(config.SEARCH_QUERIES)
+        driver, wait, cutoff = create_driver()
     except Exception as e:
-        print(f"Error scraping jobs: {e}")
+        print(f"Error creating driver: {e}")
         return
 
     try:
         service = get_gmail_service()
         profile = get_gmail_profile(service)
         print(f"Authenticated Gmail: {profile.get('emailAddress')}")
+
+        queries = config.SEARCH_QUERIES
+        if isinstance(queries, str):
+            queries = [queries]
+
         drafted_count = 0
         skipped_duplicates = 0
-
-        print(f"\nTotal jobs found: {len(jobs)}\n")
-
+        job_counter = 0
         seen_signatures = set()
         seen_description_signatures = set()
-        for i, job in enumerate(jobs, 1):
-            if drafted_count >= MAX_EMAILS_PER_RUN:
+        seen_urls = set()
+        current_run_ids = set()
+
+        for i, query in enumerate(queries):
+            jobs = scrape_query(driver, wait, query, seen_urls, cutoff)
+            drafted_count, skipped_duplicates, job_counter, stop = _process_jobs(
+                driver, jobs, service,
+                seen_signatures, seen_description_signatures,
+                current_run_ids, drafted_count, skipped_duplicates, job_counter
+            )
+            if stop:
+                print(f"Reached email limit — stopping all queries.")
                 break
-
-            title = job.get("title", "")
-            link = job.get("link", "")
-            posted_at = job.get("posted_at")
-            job_id = extract_job_id(link)
-            signature = normalize_text(title)
-
-            print(f"\nProcessing job {i}...")
-            print("Title:", title)
-
-            # Check for duplicates by job ID or normalized title signature
-            if is_job_already_processed(job_id, title):
-                print("Skipped: duplicate (already processed)")
-                skipped_duplicates += 1
-                continue
-
-            if not is_title_relevant(title):
-                print("Skipped: not relevant by title")
-                continue
-
-            # Also avoid duplicate titles within the current run
-            if signature and signature in seen_signatures:
-                print("Skipped: duplicate title in current run")
-                skipped_duplicates += 1
-                continue
-
-            seen_signatures.add(signature)
-
-            try:
-                parsed = parse_job(driver, job)
-            except Exception as e:
-                print(f"Error parsing job: {e}")
-                continue
-
-            emails = parsed.get("emails", [])
-            phones = parsed.get("phones", [])
-            desc = parsed.get("description", "")
-            desc_signature = normalize_text(desc)
-
-            if desc_signature and desc_signature in seen_description_signatures:
-                print("Skipped: duplicate job description in current run")
-                skipped_duplicates += 1
-                continue
-
-            if is_job_already_processed(job_id, title, desc):
-                print("Skipped: duplicate (already processed by description)")
-                skipped_duplicates += 1
-                continue
-
-            seen_description_signatures.add(desc_signature)
-
-            print("Emails:", emails)
-
-            if not emails:
-                print("Skipped: no email")
-                continue
-
-            best_email = pick_best_email(emails)
-
-            if not best_email:
-                print("Skipped: no valid recruiter email")
-                continue
-
-            subject = f"Interested || {title[:80]}"
-            body = build_email_body(title, best_email, desc, posted_at)
-            try:
-                draft = create_draft(service, best_email, subject, body, cc=EMPLOYER_EMAIL, html=True)
-                print(f"Draft created for {best_email} (id={draft.get('id')})")
-
-                save_applied_job(job_id, title, link, [best_email], phones, "draft_created", desc_signature)
-                drafted_count += 1
-
-                time.sleep(DELAY_BETWEEN_EMAILS)
-
-            except Exception as e:
-                print(f"Draft creation failed: {e}")
-                save_applied_job(job_id, title, link, emails, phones, "draft_failed")
+            if i < len(queries) - 1:
+                _pause(2.0, 4.5)
 
         print(f"\nDone. Drafts created: {drafted_count}")
         if skipped_duplicates > 0:
@@ -301,7 +345,7 @@ def main():
     finally:
         try:
             driver.quit()
-        except:
+        except Exception:
             pass
 
 
