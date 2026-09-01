@@ -151,13 +151,15 @@ def create_driver():
     })
 
     wait = WebDriverWait(driver, config.BROWSER_TIMEOUT)
-    cutoff = datetime.now() - timedelta(hours=config.MAX_JOB_AGE_HOURS)
+    # Nvoids posts in IST (UTC+5:30); compute cutoff in IST to match posted_at
+    now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
+    cutoff = now_ist - timedelta(hours=config.MAX_JOB_AGE_HOURS)
     print("Opening Nvoid site...")
     return driver, wait, cutoff
 
 
 def scrape_query(driver, wait, query, seen, cutoff):
-    """Scrape a single query and return its jobs. Wraps _search_query."""
+    """Scrape a single query and return its jobs."""
     try:
         jobs = _search_query(driver, wait, query, seen, cutoff)
         print(f"Found {len(jobs)} recent jobs for '{query}'")

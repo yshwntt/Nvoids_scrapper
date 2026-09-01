@@ -145,7 +145,7 @@ def build_email_body(title, recruiter_email, description, posted_at=None):
         cloud_nums.append("3")
     cloud_suffix = " - " + ", ".join(cloud_nums) if cloud_nums else ""
 
-    posted_line = f"      <strong>Posted:</strong> {posted_est.strftime('%I:%M %p, %d %b %Y')}{cloud_suffix}<br>\n" if posted_est else ""
+    posted_line = f"      <strong>Posted:</strong> {posted_at.strftime('%I:%M %p, %d %b %Y')} IST &nbsp;/&nbsp; {posted_est.strftime('%I:%M %p, %d %b %Y')} EST{cloud_suffix}<br>\n" if posted_est else ""
 
     return f"""<html>
   <body style='font-family:Arial, sans-serif; font-size:14px; color:#111;'>
@@ -206,8 +206,9 @@ def save_applied_job(job_id, title, link, emails, phones, status, description_si
 def _process_jobs(driver, jobs, service, seen_signatures, seen_description_signatures,
                   current_run_ids, drafted_count, skipped_duplicates, job_counter):
     """
-    Process a batch of jobs. Returns (drafted_count, skipped_duplicates, job_counter, stop_all).
-    stop_all=True means MAX_EMAILS_PER_RUN hit — caller should stop all queries.
+    Process a batch of jobs from one query.
+    Returns (drafted_count, skipped_duplicates, job_counter, stop_all).
+    stop_all=True only when MAX_EMAILS_PER_RUN is hit.
     """
     stop_all = False
     for job in jobs:
@@ -226,15 +227,12 @@ def _process_jobs(driver, jobs, service, seen_signatures, seen_description_signa
         print("Title:", title)
 
         if is_job_already_processed(job_id, title):
-            # If this job was drafted earlier in the current run (e.g. appeared in a
-            # prior query), just skip it — don't stop, there may be newer jobs ahead.
             if job_id in current_run_ids or signature in current_run_ids:
                 print("Skipped: duplicate from current run")
-                skipped_duplicates += 1
-                continue
-            # Otherwise it's from a previous run — all subsequent jobs are old too.
-            print("Skipped: already processed — done with this query (newer jobs come first)")
-            break
+            else:
+                print("Skipped: already processed")
+            skipped_duplicates += 1
+            continue
 
         if not is_title_relevant(title):
             print("Skipped: not relevant by title")
@@ -325,13 +323,13 @@ def main():
 
         for i, query in enumerate(queries):
             jobs = scrape_query(driver, wait, query, seen_urls, cutoff)
-            drafted_count, skipped_duplicates, job_counter, stop = _process_jobs(
+            drafted_count, skipped_duplicates, job_counter, stop_all = _process_jobs(
                 driver, jobs, service,
                 seen_signatures, seen_description_signatures,
                 current_run_ids, drafted_count, skipped_duplicates, job_counter
             )
-            if stop:
-                print(f"Reached email limit — stopping all queries.")
+            if stop_all:
+                print("Reached email limit — stopping all queries.")
                 break
             if i < len(queries) - 1:
                 _pause(2.0, 4.5)
